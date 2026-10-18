@@ -1,19 +1,39 @@
 #!/bin/bash
-# cari apa
-apt dist-upgrade -y
-apt install netfilter-persistent -y
-apt-get remove --purge ufw firewalld -y
-apt install -y screen curl jq bzip2 gzip vnstat coreutils rsyslog iftop zip unzip git apt-transport-https build-essential -y
+# ssh-vpn.sh (διορθωμένη έκδοση) - ασφαλές να ξανατρέξει (idempotent)
+# Κύριες διορθώσεις:
+#   * SSH ports: δεν πολλαπλασιάζονται πια οι εγγραφές "Port" σε κάθε εκτέλεση
+#   * AddressFamily inet + ListenAddress 0.0.0.0 -> κάτω από το όριο των 16 listen sockets
+#   * sshd -t πριν το restart, με αυτόματο rollback αν το config είναι χαλασμένο
+#   * mkdir /run/sshd, dropbear/banner/shells/iptables/rc.local χωρίς διπλότυπα
+#   * δεν κάνει exit 0 στη μέση αν υπάρχει ήδη το ddos-deflate
+
+export DEBIAN_FRONTEND=noninteractive
+
+green='\e[32m'; yell='\e[33m'; NC='\e[0m'
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Τρέξε το script ως root."
+    exit 1
+fi
+
+# ---------------------------------------------------------------
+# Ρυθμίσεις
+# ---------------------------------------------------------------
+SSH_PORTS="22 200 666 58080 51443 53 40000 500"   # ΜΕΧΡΙ 16 ports (εδώ 8, μόνο IPv4)
+DROPBEAR_MAIN_PORT=143
+DROPBEAR_EXTRA="-p 50000 -p 109 -p 110 -p 69"
+BASE="https://raw.githubusercontent.com/kokosops/vpp/main"
+ALT="https://raw.githubusercontent.com/NETWORKTWEAKER/AUTO-SCRIPT/master"
+# Αν θες να χαλαρώσεις τους κανόνες κωδικού (όπως έκανε το αρχικό script) βάλε 1
+RELAX_PASSWORD_RULES=1
 
 # initializing var
-export DEBIAN_FRONTEND=noninteractive
-MYIP=$(wget -qO- ipv4.icanhazip.com);
-MYIP2="s/xxxxxxxxx/$MYIP/g";
-NET=$(ip -o $ANU -4 route show to default | awk '{print $5}');
+MYIP=$(wget -qO- ipv4.icanhazip.com)
+NET=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
 source /etc/os-release
 ver=$VERSION_ID
 
-#detail nama perusahaan
+# detail πιστοποιητικού
 country=ID
 state=Indonesia
 locality=Jakarta
@@ -22,14 +42,106 @@ organizationalunit=none
 commonname=none
 email=none
 
-# simple password minimal
-curl -sS https://raw.githubusercontent.com/kokosops/vpp/main/ssh/password | openssl aes-256-cbc -d -a -pass pass:scvps07gg -pbkdf2 > /etc/pam.d/common-password
-chmod +x /etc/pam.d/common-password
+# ---------------------------------------------------------------
+# Βοηθητικές συναρτήσεις
+# ---------------------------------------------------------------
+apt_try() {
+    # εγκατάσταση πακέτων ένα-ένα, χωρίς να σταματά αν κάποιο δεν υπάρχει
+    for p in "$@"; do
+        apt-get install -y "$p" >/dev/null 2>&1 || echo "[skip] πακέτο '$p' δεν εγκαταστάθηκε"
+    done
+}
 
-# go to root
-cd
+rc_add() {
+    # προσθέτει γραμμή στο rc.local πριν το "exit 0", μόνο αν δεν υπάρχει ήδη
+    grep -qxF "$1" /etc/rc.local || sed -i "\$ i\\$1" /etc/rc.local
+}
 
-# Edit file /etc/systemd/system/rc-local.service
+ipt_add() {
+    # προσθέτει κανόνα iptables μόνο αν δεν υπάρχει
+    iptables -C "$@" 2>/dev/null || iptables -A "$@"
+}
+
+port_busy() {
+    # true αν η πόρτα ακούγεται από κάτι που ΔΕΝ είναι sshd (ή systemd-resolved)
+    # Το systemd-resolved (πόρτα 53) το αγνοούμε: το setup1.sh το απενεργοποιεί αργότερα (dnsdisable.sh)
+    ss -tlnpH "sport = :$1" 2>/dev/null | grep -v '"sshd"' | grep -v '"systemd-resolve"' | grep -q .
+}
+
+configure_sshd() {
+    local cfg=/etc/ssh/sshd_config
+    local bak="$cfg.bak.$(date +%s)"
+    cp "$cfg" "$bak"
+    mkdir -p /run/sshd && chmod 0755 /run/sshd
+
+    # καθάρισμα όλων των παλιών/διπλών ρυθμίσεων που διαχειριζόμαστε
+    sed -i '/^\s*\(Port\|AddressFamily\|ListenAddress\|Banner\)\s/d' "$cfg"
+    sed -i '/^# --- ssh-vpn.sh ---$/d' "$cfg"
+    sed -i 's/^AcceptEnv/#AcceptEnv/' "$cfg"
+    sed -i 's/^#\?\s*PasswordAuthentication.*/PasswordAuthentication yes/' "$cfg"
+
+    # drop-in αρχεία (Ubuntu/cloud-init) μπορούν να επικαλύψουν τα παραπάνω
+    if ls /etc/ssh/sshd_config.d/*.conf >/dev/null 2>&1; then
+        sed -i '/^\s*\(Port\|AddressFamily\|ListenAddress\)\s/d' /etc/ssh/sshd_config.d/*.conf
+        sed -i 's/^\s*PasswordAuthentication\s.*/PasswordAuthentication yes/' /etc/ssh/sshd_config.d/*.conf
+    fi
+
+    {
+        echo ""
+        echo "# --- ssh-vpn.sh ---"
+        echo "AddressFamily inet"
+        echo "ListenAddress 0.0.0.0"
+        for p in $SSH_PORTS; do
+            if [ "$p" != "22" ] && port_busy "$p"; then
+                echo "# Port $p παραλείφθηκε: ήδη σε χρήση από άλλη υπηρεσία" >> "$cfg.skipped"
+                echo "[warn] η πόρτα $p είναι σε χρήση, παραλείπεται για το sshd"
+                continue
+            fi
+            echo "Port $p"
+        done
+        echo "Banner /etc/issue.net"
+    } >> "$cfg"
+    rm -f "$cfg.skipped"
+
+    if sshd -t; then
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd
+        echo -e "[ ${green}ok${NC} ] sshd ξεκίνησε"
+    else
+        echo "[ERROR] το sshd_config έχει πρόβλημα, επαναφορά από $bak"
+        cp "$bak" "$cfg"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------
+# Βασικά πακέτα
+# ---------------------------------------------------------------
+apt-get update -y
+apt-get dist-upgrade -y
+apt-get install -y netfilter-persistent
+apt-get remove --purge ufw firewalld exim4 -y
+
+apt_try screen curl jq bzip2 gzip vnstat coreutils rsyslog iftop zip unzip git \
+    apt-transport-https build-essential shc wget figlet ruby python3 make cmake \
+    net-tools nano sed gnupg bc dirmngr libxml-parser-perl neofetch lsof \
+    libsqlite3-dev libz-dev gcc g++ libreadline-dev zlib1g-dev libssl-dev dos2unix
+gem install lolcat >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------
+# Κανόνες κωδικού (τοπικά, χωρίς κατέβασμα κρυπτογραφημένου PAM αρχείου)
+# ---------------------------------------------------------------
+if [ "$RELAX_PASSWORD_RULES" = "1" ] && [ -f /etc/pam.d/common-password ]; then
+    cp -n /etc/pam.d/common-password /etc/pam.d/common-password.orig
+    sed -i 's/^\(password\s\+requisite\s\+pam_pwquality.so.*\)/# \1/' /etc/pam.d/common-password
+    sed -i 's/^\(password\s\+requisite\s\+pam_cracklib.so.*\)/# \1/' /etc/pam.d/common-password
+    sed -i 's/\(pam_unix.so.*\)\bobscure\b/\1/' /etc/pam.d/common-password
+fi
+
+cd /root || exit 1
+
+# ---------------------------------------------------------------
+# rc.local
+# ---------------------------------------------------------------
 cat > /etc/systemd/system/rc-local.service <<-END
 [Unit]
 Description=/etc/rc.local
@@ -45,189 +157,86 @@ SysVStartPriority=99
 WantedBy=multi-user.target
 END
 
-# nano /etc/rc.local
 cat > /etc/rc.local <<-END
 #!/bin/sh -e
 # rc.local
-# By default this script does nothing.
 exit 0
 END
-
-# Ubah izin akses
 chmod +x /etc/rc.local
-
-# enable rc local
+systemctl daemon-reload
 systemctl enable rc-local
 systemctl start rc-local.service
 
 # disable ipv6
 echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
-sed -i '$ i\echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6' /etc/rc.local
+rc_add 'echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6'
 
-#update
-apt update -y
-apt upgrade -y
-apt dist-upgrade -y
-apt-get remove --purge ufw firewalld -y
-apt-get remove --purge exim4 -y
-
-#install jq
-apt -y install jq
-
-#install shc
-apt -y install shc
-
-# install wget and curl
-apt -y install wget curl
-
-#figlet
-apt-get install figlet -y
-apt-get install ruby -y
-apt install python -y
-apt install make -y
-apt install cmake -y
-apt install coreutils -y
-apt install rsyslog -y
-apt install net-tools -y
-apt install zip -y
-apt install unzip -y
-apt install nano -y
-apt install sed -y
-apt install gnupg -y
-apt install gnupg1 -y
-apt install bc -y
-apt install jq -y
-apt install apt-transport-https -y
-apt install build-essential -y
-apt install dirmngr -y
-apt install libxml-parser-perl -y
-apt install neofetch -y
-apt install git -y
-apt install lsof -y
-apt install libsqlite3-dev -y
-apt install libz-dev -y
-apt install gcc -y
-apt install g++ -y
-apt install libreadline-dev -y
-apt install zlib1g-dev -y
-apt install libssl-dev -y
-apt install libssl1.0-dev -y
-apt install dos2unix -y
-gem install lolcat
-
-# set time GMT +7
+# timezone GMT+7
 ln -fs /usr/share/zoneinfo/Asia/Jakarta /etc/localtime
 
-# set locale
-sed -i 's/AcceptEnv/#AcceptEnv/g' /etc/ssh/sshd_config
+# ---------------------------------------------------------------
+# nginx
+# ---------------------------------------------------------------
+apt-get install -y nginx certbot
+rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default
+wget -O /etc/nginx/nginx.conf "$BASE/ssh/nginx.conf"
+rm -f /etc/nginx/conf.d/vps.conf /etc/nginx/conf.d/default.conf
+wget -O /etc/nginx/conf.d/vps.conf "$BASE/ssh/vps.conf"
 
+mkdir -p /etc/systemd/system/nginx.service.d
+printf "[Service]\nExecStartPost=/bin/sleep 0.1\n" > /etc/systemd/system/nginx.service.d/override.conf
+systemctl daemon-reload
+systemctl restart nginx
 
-install_ssl(){
-    if [ -f "/usr/bin/apt-get" ];then
-            isDebian=`cat /etc/issue|grep Debian`
-            if [ "$isDebian" != "" ];then
-                    apt-get install -y nginx certbot
-                    apt install -y nginx certbot
-                    sleep 3s
-            else
-                    apt-get install -y nginx certbot
-                    apt install -y nginx certbot
-                    sleep 3s
-            fi
-    else
-        yum install -y nginx certbot
-        sleep 3s
+mkdir -p /home/vps/public_html/ss-ws /home/vps/public_html/clash-ws
+wget -O /home/vps/public_html/index.html "$BASE/ssh/index"
+wget -O /home/vps/public_html/.htaccess "$ALT/ssh/.htaccess"
+
+# ---------------------------------------------------------------
+# badvpn
+# ---------------------------------------------------------------
+wget -O /usr/bin/badvpn-udpgw "$BASE/ssh/newudpgw"
+chmod +x /usr/bin/badvpn-udpgw
+for p in 7100 7200 7300 7400 7500 7600 7700 7800 7900; do
+    rc_add "screen -dmS badvpn$p badvpn-udpgw --listen-addr 127.0.0.1:$p --max-clients 500"
+    if ! ss -tlnH "sport = :$p" 2>/dev/null | grep -q . && ! ss -ulnH "sport = :$p" 2>/dev/null | grep -q .; then
+        screen -dmS "badvpn$p" badvpn-udpgw --listen-addr 127.0.0.1:$p --max-clients 500
     fi
+done
 
-    systemctl stop nginx.service
+# ---------------------------------------------------------------
+# Dropbear (ΠΡΩΤΑ, ώστε το banner/ports να μπουν σωστά)
+# ---------------------------------------------------------------
+echo "=== Install Dropbear ==="
+apt-get install -y dropbear
+wget -O /etc/issue.net "$BASE/banner/banner.conf"
 
-    if [ -f "/usr/bin/apt-get" ];then
-            isDebian=`cat /etc/issue|grep Debian`
-            if [ "$isDebian" != "" ];then
-                    echo "A" | certbot certonly --renew-by-default --register-unsafely-without-email --standalone -d $domain
-                    sleep 3s
-            else
-                    echo "A" | certbot certonly --renew-by-default --register-unsafely-without-email --standalone -d $domain
-                    sleep 3s
-            fi
+set_kv() {  # set_kv ΑΡΧΕΙΟ ΚΛΕΙΔΙ 'ΤΙΜΗ'  (δουλεύει και αν η γραμμή είναι σχολιασμένη)
+    if grep -q "^#\?\s*$2=" "$1"; then
+        sed -i "s|^#\?\s*$2=.*|$2=$3|" "$1"
     else
-        echo "Y" | certbot certonly --renew-by-default --register-unsafely-without-email --standalone -d $domain
-        sleep 3s
+        echo "$2=$3" >> "$1"
     fi
 }
+set_kv /etc/default/dropbear NO_START 0
+set_kv /etc/default/dropbear DROPBEAR_PORT "$DROPBEAR_MAIN_PORT"
+set_kv /etc/default/dropbear DROPBEAR_EXTRA_ARGS "\"$DROPBEAR_EXTRA\""
+set_kv /etc/default/dropbear DROPBEAR_BANNER '"/etc/issue.net"'
 
-# install webserver
-apt -y install nginx
-cd
-rm /etc/nginx/sites-enabled/default
-rm /etc/nginx/sites-available/default
-wget -O /etc/nginx/nginx.conf "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/nginx.conf"
-rm /etc/nginx/conf.d/vps.conf
-wget -O /etc/nginx/conf.d/vps.conf "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/vps.conf"
-/etc/init.d/nginx restart
+grep -qxF "/bin/false" /etc/shells || echo "/bin/false" >> /etc/shells
+grep -qxF "/usr/sbin/nologin" /etc/shells || echo "/usr/sbin/nologin" >> /etc/shells
 
-mkdir /etc/systemd/system/nginx.service.d
-printf "[Service]\nExecStartPost=/bin/sleep 0.1\n" > /etc/systemd/system/nginx.service.d/override.conf
-rm /etc/nginx/conf.d/default.conf
-systemctl daemon-reload
-service nginx restart
-cd
-mkdir /home/vps
-mkdir /home/vps/public_html
-wget -O /home/vps/public_html/index.html "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/index"
-wget -O /home/vps/public_html/.htaccess "https://raw.githubusercontent.com/NETWORKTWEAKER/AUTO-SCRIPT/master/ssh/.htaccess"
-mkdir /home/vps/public_html/ss-ws
-mkdir /home/vps/public_html/clash-ws
-# install badvpn
-cd
-wget -O /usr/bin/badvpn-udpgw "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/newudpgw"
-chmod +x /usr/bin/badvpn-udpgw
-sed -i '$ i\screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7100 --max-clients 500' /etc/rc.local
-sed -i '$ i\screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7200 --max-clients 500' /etc/rc.local
-sed -i '$ i\screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 500' /etc/rc.local
-sed -i '$ i\screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7400 --max-clients 500' /etc/rc.local
-sed -i '$ i\screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7500 --max-clients 500' /etc/rc.local
-sed -i '$ i\screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7600 --max-clients 500' /etc/rc.local
-sed -i '$ i\screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7700 --max-clients 500' /etc/rc.local
-sed -i '$ i\screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7800 --max-clients 500' /etc/rc.local
-sed -i '$ i\screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7900 --max-clients 500' /etc/rc.local
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7100 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7200 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7400 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7500 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7600 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7700 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7800 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7900 --max-clients 500
+# ---------------------------------------------------------------
+# OpenSSH (ports) - το κρίσιμο κομμάτι
+# ---------------------------------------------------------------
+configure_sshd || echo "[warn] το sshd δεν ρυθμίστηκε, έλεγξε χειροκίνητα"
+systemctl restart dropbear || /etc/init.d/dropbear restart
 
-# setting port ssh
-cd
-sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
-sed -i '/Port 22/a Port 500' /etc/ssh/sshd_config
-sed -i '/Port 22/a Port 40000' /etc/ssh/sshd_config
-sed -i '/Port 22/a Port 53' /etc/ssh/sshd_config
-sed -i '/Port 22/a Port 51443' /etc/ssh/sshd_config
-sed -i '/Port 22/a Port 58080' /etc/ssh/sshd_config
-sed -i '/Port 22/a Port 666' /etc/ssh/sshd_config
-sed -i '/Port 22/a Port 200' /etc/ssh/sshd_config
-sed -i '/Port 22/a Port 22' /etc/ssh/sshd_config
-/etc/init.d/ssh restart
-
-echo "=== Install Dropbear ==="
-# install dropbear
-apt -y install dropbear
-sed -i 's/NO_START=1/NO_START=0/g' /etc/default/dropbear
-sed -i 's/DROPBEAR_PORT=22/DROPBEAR_PORT=143/g' /etc/default/dropbear
-sed -i 's/DROPBEAR_EXTRA_ARGS=/DROPBEAR_EXTRA_ARGS="-p 50000 -p 109 -p 110 -p 69"/g' /etc/default/dropbear
-echo "/bin/false" >> /etc/shells
-echo "/usr/sbin/nologin" >> /etc/shells
-/etc/init.d/ssh restart
-/etc/init.d/dropbear restart
-
-cd
-# install stunnel
-apt install stunnel4 -y
+# ---------------------------------------------------------------
+# stunnel
+# ---------------------------------------------------------------
+cd /root || exit 1
+apt-get install -y stunnel4
 cat > /etc/stunnel/stunnel.conf <<-END
 cert = /etc/stunnel/stunnel.pem
 client = no
@@ -235,11 +244,11 @@ socket = a:SO_REUSEADDR=1
 socket = l:TCP_NODELAY=1
 socket = r:TCP_NODELAY=1
 
-[dropbear]
+[ssh-ssl]
 accept = 222
 connect = 127.0.0.1:22
 
-[dropbear]
+[dropbear-ssl]
 accept = 777
 connect = 127.0.0.1:109
 
@@ -253,225 +262,143 @@ connect = 127.0.0.1:1194
 
 END
 
-# make a certificate
 openssl genrsa -out key.pem 2048
 openssl req -new -x509 -key key.pem -out cert.pem -days 1095 \
--subj "/C=$country/ST=$state/L=$locality/O=$organization/OU=$organizationalunit/CN=$commonname/emailAddress=$email"
-cat key.pem cert.pem >> /etc/stunnel/stunnel.pem
+    -subj "/C=$country/ST=$state/L=$locality/O=$organization/OU=$organizationalunit/CN=$commonname/emailAddress=$email"
+cat key.pem cert.pem > /etc/stunnel/stunnel.pem
+chmod 600 /etc/stunnel/stunnel.pem
 
-# konfigurasi stunnel4
 sed -i 's/ENABLED=0/ENABLED=1/g' /etc/default/stunnel4
-/lib/systemd/systemd-sysv-install enable stunnel4
-systemctl start stunnel4
-/etc/init.d/stunnel4 restart
+systemctl enable stunnel4
+systemctl restart stunnel4
 
+# ---------------------------------------------------------------
+# fail2ban
+# ---------------------------------------------------------------
+apt-get install -y fail2ban
 
-# install fail2ban
-apt -y install fail2ban
-
-# Instal DDOS Flate
-if [ -d '/usr/local/ddos' ]; then
-	echo; echo; echo "Please un-install the previous version first"
-	exit 0
+# ---------------------------------------------------------------
+# DOS-Deflate
+# ---------------------------------------------------------------
+if [ -d /usr/local/ddos ]; then
+    echo "DOS-Deflate υπάρχει ήδη, παραλείπεται."
 else
-	mkdir /usr/local/ddos
+    mkdir -p /usr/local/ddos
+    echo 'Installing DOS-Deflate 0.6'
+    wget -q -O /usr/local/ddos/ddos.conf       http://www.inetbase.com/scripts/ddos/ddos.conf
+    wget -q -O /usr/local/ddos/LICENSE         http://www.inetbase.com/scripts/ddos/LICENSE
+    wget -q -O /usr/local/ddos/ignore.ip.list  http://www.inetbase.com/scripts/ddos/ignore.ip.list
+    wget -q -O /usr/local/ddos/ddos.sh         http://www.inetbase.com/scripts/ddos/ddos.sh
+    chmod 0755 /usr/local/ddos/ddos.sh
+    ln -sf /usr/local/ddos/ddos.sh /usr/local/sbin/ddos
+    /usr/local/ddos/ddos.sh --cron > /dev/null 2>&1
+    echo 'DOS-Deflate εγκαταστάθηκε (config: /usr/local/ddos/ddos.conf)'
 fi
-clear
-echo; echo 'Installing DOS-Deflate 0.6'; echo
-echo; echo -n 'Downloading source files...'
-wget -q -O /usr/local/ddos/ddos.conf http://www.inetbase.com/scripts/ddos/ddos.conf
-echo -n '.'
-wget -q -O /usr/local/ddos/LICENSE http://www.inetbase.com/scripts/ddos/LICENSE
-echo -n '.'
-wget -q -O /usr/local/ddos/ignore.ip.list http://www.inetbase.com/scripts/ddos/ignore.ip.list
-echo -n '.'
-wget -q -O /usr/local/ddos/ddos.sh http://www.inetbase.com/scripts/ddos/ddos.sh
-chmod 0755 /usr/local/ddos/ddos.sh
-cp -s /usr/local/ddos/ddos.sh /usr/local/sbin/ddos
-echo '...done'
-echo; echo -n 'Creating cron to run script every minute.....(Default setting)'
-/usr/local/ddos/ddos.sh --cron > /dev/null 2>&1
-echo '.....done'
-echo; echo 'Installation has completed.'
-echo 'Config file is at /usr/local/ddos/ddos.conf'
-echo 'Please send in your comments and/or suggestions to zaf@vsnl.com'
 
-# // banner /etc/issue.net
-wget -O /etc/issue.net "https://raw.githubusercontent.com/kokosops/vpp/main/banner/banner.conf"
-echo "Banner /etc/issue.net" >> /etc/ssh/sshd_config
-sed -i 's@DROPBEAR_BANNER=""@DROPBEAR_BANNER="/etc/issue.net"@g' /etc/default/dropbear
-
-# blokir torrent
-iptables -A FORWARD -m string --string "get_peers" --algo bm -j DROP
-iptables -A FORWARD -m string --string "announce_peer" --algo bm -j DROP
-iptables -A FORWARD -m string --string "find_node" --algo bm -j DROP
-iptables -A FORWARD -m string --algo bm --string "BitTorrent" -j DROP
-iptables -A FORWARD -m string --algo bm --string "BitTorrent protocol" -j DROP
-iptables -A FORWARD -m string --algo bm --string "peer_id=" -j DROP
-iptables -A FORWARD -m string --algo bm --string ".torrent" -j DROP
-iptables -A FORWARD -m string --algo bm --string "announce.php?passkey=" -j DROP
-iptables -A FORWARD -m string --algo bm --string "torrent" -j DROP
-iptables -A FORWARD -m string --algo bm --string "announce" -j DROP
-iptables -A FORWARD -m string --algo bm --string "info_hash" -j DROP
+# ---------------------------------------------------------------
+# Μπλοκάρισμα torrent
+# ---------------------------------------------------------------
+ipt_add FORWARD -m string --string "get_peers" --algo bm -j DROP
+ipt_add FORWARD -m string --string "announce_peer" --algo bm -j DROP
+ipt_add FORWARD -m string --string "find_node" --algo bm -j DROP
+ipt_add FORWARD -m string --algo bm --string "BitTorrent" -j DROP
+ipt_add FORWARD -m string --algo bm --string "BitTorrent protocol" -j DROP
+ipt_add FORWARD -m string --algo bm --string "peer_id=" -j DROP
+ipt_add FORWARD -m string --algo bm --string ".torrent" -j DROP
+ipt_add FORWARD -m string --algo bm --string "announce.php?passkey=" -j DROP
+ipt_add FORWARD -m string --algo bm --string "torrent" -j DROP
+ipt_add FORWARD -m string --algo bm --string "announce" -j DROP
+ipt_add FORWARD -m string --algo bm --string "info_hash" -j DROP
 iptables-save > /etc/iptables.up.rules
-iptables-restore -t < /etc/iptables.up.rules
 netfilter-persistent save
 netfilter-persistent reload
 
-# download script
-cd /usr/bin
+# ---------------------------------------------------------------
+# Menu / scripts
+# ---------------------------------------------------------------
+cd /usr/bin || exit 1
+fetch() { wget -O "$1" "$2" && chmod +x "$1"; }
+
 # menu
-wget -O menu "https://raw.githubusercontent.com/kokosops/vpp/main/menu/menu.sh"
-wget -O m-vmess "https://raw.githubusercontent.com/kokosops/vpp/main/menu/m-vmess.sh"
-wget -O m-vless "https://raw.githubusercontent.com/kokosops/vpp/main/menu/m-vless.sh"
-wget -O running "https://raw.githubusercontent.com/kokosops/vpp/main/menu/running.sh"
-wget -O clearcache "https://raw.githubusercontent.com/kokosops/vpp/main/menu/clearcache.sh"
-wget -O m-ssws "https://raw.githubusercontent.com/kokosops/vpp/main/menu/m-ssws.sh"
-wget -O m-trojan "https://raw.githubusercontent.com/kokosops/vpp/main/menu/m-trojan.sh"
+fetch menu       "$BASE/menu/menu.sh"
+fetch m-vmess    "$BASE/menu/m-vmess.sh"
+fetch m-vless    "$BASE/menu/m-vless.sh"
+fetch running    "$BASE/menu/running.sh"
+fetch clearcache "$BASE/menu/clearcache.sh"
+fetch m-ssws     "$BASE/menu/m-ssws.sh"
+fetch m-trojan   "$BASE/menu/m-trojan.sh"
 
 # menu ssh ovpn
-wget -O m-sshovpn "https://raw.githubusercontent.com/kokosops/vpp/main/menu/m-sshovpn.sh"
-wget -O usernew "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/usernew.sh"
-wget -O trial "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/trial.sh"
-wget -O renew "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/renew.sh"
-wget -O hapus "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/hapus.sh"
-wget -O cek "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/cek.sh"
-wget -O member "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/member.sh"
-wget -O delete "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/delete.sh"
-wget -O autokill "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/autokill.sh"
-wget -O ceklim "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/ceklim.sh"
-wget -O tendang "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/tendang.sh"
-wget -O sshws "https://raw.githubusercontent.com/NETWORKTWEAKER/AUTO-SCRIPT/master/ssh/sshws.sh"
-wget -O user-lock "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/user-lock.sh"
-wget -O user-unlock "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/user-unlock.sh"
+fetch m-sshovpn  "$BASE/menu/m-sshovpn.sh"
+fetch usernew    "$BASE/ssh/usernew.sh"
+fetch trial      "$BASE/ssh/trial.sh"
+fetch renew      "$BASE/ssh/renew.sh"
+fetch hapus      "$BASE/ssh/hapus.sh"
+fetch cek        "$BASE/ssh/cek.sh"
+fetch member     "$BASE/ssh/member.sh"
+fetch delete     "$BASE/ssh/delete.sh"
+fetch autokill   "$BASE/ssh/autokill.sh"
+fetch ceklim     "$BASE/ssh/ceklim.sh"
+fetch tendang    "$BASE/ssh/tendang.sh"
+fetch sshws      "$ALT/ssh/sshws.sh"
+fetch user-lock  "$BASE/ssh/user-lock.sh"
+fetch user-unlock "$BASE/ssh/user-unlock.sh"
 
 # menu system
-wget -O m-system "https://raw.githubusercontent.com/kokosops/vpp/main/menu/m-system.sh"
-wget -O m-domain "https://raw.githubusercontent.com/kokosops/vpp/main/menu/m-domain.sh"
-wget -O add-host "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/add-host.sh"
-wget -O certv2ray "https://raw.githubusercontent.com/kokosops/vpp/main/xray/certv2ray.sh"
-wget -O speedtest "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/speedtest_cli.py"
-wget -O auto-reboot "https://raw.githubusercontent.com/kokosops/vpp/main/menu/auto-reboot.sh"
-wget -O restart "https://raw.githubusercontent.com/kokosops/vpp/main/menu/restart.sh"
-wget -O bw "https://raw.githubusercontent.com/kokosops/vpp/main/menu/bw.sh"
-wget -O m-tcp "https://raw.githubusercontent.com/kokosops/vpp/main/menu/tcp.sh"
-wget -O xp "https://raw.githubusercontent.com/kokosops/vpp/main/ssh/xp.sh"
-wget -O sshws "https://raw.githubusercontent.com/NETWORKTWEAKER/AUTO-SCRIPT/master/ssh/sshws.sh"
-wget -O m-dns "https://raw.githubusercontent.com/kokosops/vpp/main/menu/m-dns.sh"
+fetch m-system   "$BASE/menu/m-system.sh"
+fetch m-domain   "$BASE/menu/m-domain.sh"
+fetch add-host   "$BASE/ssh/add-host.sh"
+fetch certv2ray  "$BASE/xray/certv2ray.sh"
+fetch speedtest  "$BASE/ssh/speedtest_cli.py"
+fetch auto-reboot "$BASE/menu/auto-reboot.sh"
+fetch restart    "$BASE/menu/restart.sh"
+fetch bw         "$BASE/menu/bw.sh"
+fetch m-tcp      "$BASE/menu/tcp.sh"
+fetch xp         "$BASE/ssh/xp.sh"
+fetch m-dns      "$BASE/menu/m-dns.sh"
+cd /root || exit 1
 
-chmod +x menu
-chmod +x m-vmess
-chmod +x m-vless
-chmod +x running
-chmod +x clearcache
-chmod +x m-ssws
-chmod +x m-trojan
-
-chmod +x m-sshovpn
-chmod +x usernew
-chmod +x trial
-chmod +x renew
-chmod +x hapus
-chmod +x cek
-chmod +x member
-chmod +x delete
-chmod +x autokill
-chmod +x ceklim
-chmod +x tendang
-chmod +x sshws
-chmod +x user-lock
-chmod +x user-unlock
-
-chmod +x m-system
-chmod +x m-domain
-chmod +x add-host
-chmod +x certv2ray
-chmod +x speedtest
-chmod +x auto-reboot
-chmod +x restart
-chmod +x bw
-chmod +x m-tcp
-chmod +x xp
-chmod +x sshws
-chmod +x m-dns
-cd
-
-
-# NOTE: The nightly auto-reboot cron (/etc/cron.d/re_otm, "0 2 * * * root /sbin/reboot")
-# was intentionally removed - this VPS must NOT reboot automatically every night.
-
+# ---------------------------------------------------------------
+# cron
+# NOTE: το νυχτερινό auto-reboot αφαιρέθηκε σκόπιμα (το VPS δεν πρέπει να κάνει reboot κάθε βράδυ)
+# ---------------------------------------------------------------
 cat > /etc/cron.d/xp_otm <<-END
 SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 0 0 * * * root /usr/bin/xp
 END
 
-cat > /home/re_otm <<-END
-7
-END
-
+echo "7" > /home/re_otm
 service cron restart >/dev/null 2>&1
-service cron reload >/dev/null 2>&1
 
-# remove unnecessary files
-sleep 0.5
-echo -e "[ ${green}INFO$NC ] Clearing trash"
-apt autoclean -y >/dev/null 2>&1
-
+# ---------------------------------------------------------------
+# Καθαρισμός
+# ---------------------------------------------------------------
+echo -e "[ ${green}INFO${NC} ] Clearing trash"
+apt-get autoclean -y >/dev/null 2>&1
 if dpkg -s unscd >/dev/null 2>&1; then
-apt -y remove --purge unscd >/dev/null 2>&1
+    apt-get -y remove --purge unscd >/dev/null 2>&1
 fi
+apt-get -y --purge remove 'samba*' 'apache2*' 'bind9*' >/dev/null 2>&1
+apt-get -y remove 'sendmail*' >/dev/null 2>&1
+apt-get autoremove -y >/dev/null 2>&1
 
-apt-get -y --purge remove samba* >/dev/null 2>&1
-apt-get -y --purge remove apache2* >/dev/null 2>&1
-apt-get -y --purge remove bind9* >/dev/null 2>&1
-apt-get -y remove sendmail* >/dev/null 2>&1
-apt autoremove -y >/dev/null 2>&1
-# finishing
-cd
+# ---------------------------------------------------------------
+# Τελικό restart υπηρεσιών
+# ---------------------------------------------------------------
 chown -R www-data:www-data /home/vps/public_html
-sleep 0.5
-echo -e "$yell[SERVICE]$NC Restart All service SSH & OVPN"
-/etc/init.d/nginx restart >/dev/null 2>&1
-sleep 0.5
-echo -e "[ ${green}ok${NC} ] Restarting nginx"
-/etc/init.d/openvpn restart >/dev/null 2>&1
-sleep 0.5
-echo -e "[ ${green}ok${NC} ] Restarting cron "
-/etc/init.d/ssh restart >/dev/null 2>&1
-sleep 0.5
-echo -e "[ ${green}ok${NC} ] Restarting ssh "
-/etc/init.d/dropbear restart >/dev/null 2>&1
-sleep 0.5
-echo -e "[ ${green}ok${NC} ] Restarting dropbear "
-/etc/init.d/fail2ban restart >/dev/null 2>&1
-sleep 0.5
-echo -e "[ ${green}ok${NC} ] Restarting fail2ban "
-/etc/init.d/stunnel4 restart >/dev/null 2>&1
-sleep 0.5
-echo -e "[ ${green}ok${NC} ] Restarting stunnel4 "
-/etc/init.d/vnstat restart >/dev/null 2>&1
-sleep 0.5
-echo -e "[ ${green}ok${NC} ] Restarting vnstat "
-/etc/init.d/squid restart >/dev/null 2>&1
+echo -e "${yell}[SERVICE]${NC} Restart All service SSH & OVPN"
+for s in nginx openvpn ssh dropbear fail2ban stunnel4 vnstat squid; do
+    systemctl restart "$s" >/dev/null 2>&1 \
+        && echo -e "[ ${green}ok${NC} ] Restarting $s" \
+        || echo "[ -- ] $s δεν υπάρχει ή δεν ξεκίνησε"
+done
 
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7100 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7200 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7400 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7500 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7600 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7700 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7800 --max-clients 500
-screen -dmS badvpn badvpn-udpgw --listen-addr 127.0.0.1:7900 --max-clients 500
-history -c
-echo "unset HISTFILE" >> /etc/profile
+# ιστορικό εντολών: απενεργοποίηση (μία φορά)
+grep -qxF "unset HISTFILE" /etc/profile || echo "unset HISTFILE" >> /etc/profile
 
+rm -f /root/key.pem /root/cert.pem /root/bbr.sh
+# Το script ΔΕΝ διαγράφεται πια μόνο του (rm -f /root/ssh-vpn.sh αφαιρέθηκε)
 
-rm -f /root/key.pem
-rm -f /root/cert.pem
-rm -f /root/ssh-vpn.sh
-rm -f /root/bbr.sh
-
-# finihsing
-clear
+echo ""
+echo "Τέλος. Έλεγχος: ss -tlnp | grep -E 'sshd|dropbear|stunnel'"
